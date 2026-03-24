@@ -413,6 +413,100 @@ pub fn crc32(data: &[u8]) -> u32 {
     crc32_single(data)
 }
 
+// ============================================================================
+// Hasher implementation for incremental hashing
+// ============================================================================
+
+use std::hash::Hasher;
+
+/// A CRC32 hasher that implements `std::hash::Hasher`.
+///
+/// # Example
+///
+/// ```
+/// use std::hash::Hasher;
+/// use crc32_autotune::Crc32Hasher;
+///
+/// let mut hasher = Crc32Hasher::new();
+/// hasher.write(b"hello ");
+/// hasher.write(b"world");
+/// // CRC32 of "hello world" = 222957957 (0x0D4A1185)
+/// assert_eq!(hasher.finish() as u32, 222957957);
+/// ```
+pub struct Crc32Hasher {
+    state: u32,
+    // For incremental hashing, we buffer small writes
+    buffer: Vec<u8>,
+}
+
+impl Default for Crc32Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Crc32Hasher {
+    /// Create a new CRC32 hasher with initial state 0.
+    pub fn new() -> Self {
+        Self {
+            state: 0,
+            buffer: Vec::with_capacity(256),
+        }
+    }
+
+    /// Create a hasher with a custom initial state.
+    pub fn with_initial(initial: u32) -> Self {
+        Self {
+            state: initial,
+            buffer: Vec::with_capacity(256),
+        }
+    }
+
+    /// Finalize and return the CRC32 checksum.
+    pub fn finalize(&self) -> u32 {
+        self.state
+    }
+
+    /// Reset the hasher to initial state.
+    pub fn reset(&mut self) {
+        self.state = 0;
+        self.buffer.clear();
+    }
+
+    fn flush_buffer(&mut self) {
+        if !self.buffer.is_empty() {
+            self.state = crc32_combine(self.state, crc32(&self.buffer), self.buffer.len() as u64);
+            self.buffer.clear();
+        }
+    }
+}
+
+impl Hasher for Crc32Hasher {
+    fn finish(&self) -> u64 {
+        // Note: caller should ensure buffer is flushed before calling finish
+        // For safety, we compute the final CRC including any buffered data
+        if self.buffer.is_empty() {
+            self.state as u64
+        } else {
+            crc32_combine(self.state, crc32(&self.buffer), self.buffer.len() as u64) as u64
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.len() < 256 {
+            // Buffer small writes
+            self.buffer.extend_from_slice(bytes);
+            if self.buffer.len() >= 1024 {
+                self.flush_buffer();
+            }
+        } else {
+            // Large writes go directly through
+            self.flush_buffer();
+            self.state = crc32_combine(self.state, crc32(bytes), bytes.len() as u64);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +546,35 @@ mod tests {
         // Large enough to trigger parallel path
         let test_data: Vec<u8> = (0..=255u8).cycle().take(2_000_000).collect();
         assert_eq!(crc32(&test_data), crc32fast::hash(&test_data));
+    }
+    #[test]
+    fn test_hasher() {
+        let data = b"hello world";
+        
+        // Direct computation
+        let direct = crc32(data);
+        
+        // Incremental via Hasher
+        let mut hasher = Crc32Hasher::new();
+        hasher.write(data);
+        let incremental = hasher.finish() as u32;
+        
+        assert_eq!(direct, incremental);
+    }
+    #[test]
+    fn test_hasher_chunked() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+        
+        // Direct
+        let direct = crc32(&data);
+        
+        // Chunked incremental
+        let mut hasher = Crc32Hasher::new();
+        for chunk in data.chunks(1024) {
+            hasher.write(chunk);
+        }
+        let incremental = hasher.finish() as u32;
+        
+        assert_eq!(direct, incremental);
     }
 }
