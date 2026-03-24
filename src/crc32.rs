@@ -1,4 +1,4 @@
-//! CRC32 - SIMD (PCLMULQDQ) + slice-by-8 hybrid
+//! CRC32 - SIMD (PCLMULQDQ) + slice-by-8 hybrid with parallel support
 //!
 //! Supports: AVX-512 (VPCLMULQDQ), SSE (PCLMULQDQ), software fallback
 //! Based on Intel whitepaper: "Fast CRC computation for generic polynomials"
@@ -38,6 +38,40 @@ const S8: [[u32; 256]; 8] = {
     }
     t
 };
+
+// Pre-computed x^(2^n) mod poly for combine operation
+static X2N_TABLE: [u32; 32] = [
+    0x00800000, 0x00008000, 0xedb88320, 0xb1e6b092, 0xa06a2517, 0xed627dae, 0x88d14467, 0xd7bbfe6a,
+    0xec447f11, 0x8e7ea170, 0x6427800e, 0x4d47bae0, 0x09fe548f, 0x83852d0f, 0x30362f1a, 0x7b5a9cc3,
+    0x31fec169, 0x9fec022a, 0x6c8dedc4, 0x15d6874d, 0x5fde7a4e, 0xbad90e37, 0x2e4e5eef, 0x4eaba214,
+    0xa8a472c0, 0x429a969e, 0x148d302a, 0xc40ba6d0, 0xc4e22c3c, 0x40000000, 0x20000000, 0x08000000,
+];
+
+/// GF(2) polynomial multiplication for combine
+fn gf2_multiply(a: u32, mut b: u32) -> u32 {
+    let mut p = 0u32;
+    for i in 0..32 {
+        p ^= b & ((a >> (31 - i)) & 1).wrapping_neg();
+        b = (b >> 1) ^ ((b & 1).wrapping_neg() & POLY);
+    }
+    p
+}
+
+/// Combine two CRC32 values: crc(a||b) = combine(crc(a), crc(b), len(b))
+#[inline]
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+    let mut p = crc1;
+    let n = 64 - len2.leading_zeros();
+    for i in 0..n {
+        if (len2 >> i & 1) != 0 {
+            p = gf2_multiply(X2N_TABLE[(i & 0x1F) as usize], p);
+        }
+    }
+    p ^ crc2
+}
 
 /// Fallback: slice-by-8 (pure software, no SIMD)
 #[inline]
@@ -181,12 +215,11 @@ mod avx512 {
     use super::*;
     use std::arch::x86_64::*;
 
-    // Folding constants for 512-bit (extended from 128-bit)
-    // These are for folding 512 bits down
-    const K1_512: i64 = 0x154442bd4;  // x^(128+32) mod poly
-    const K2_512: i64 = 0x1c6e41596;  // x^(128+64) mod poly
-    const K3_512: i64 = 0x1751997d0;  // x^(256+32) mod poly
-    const K4_512: i64 = 0x0ccaa009e;  // x^(256+64) mod poly
+    // Folding constants for 512-bit
+    const K1_512: i64 = 0x154442bd4;
+    const K2_512: i64 = 0x1c6e41596;
+    const K3_512: i64 = 0x1751997d0;
+    const K4_512: i64 = 0x0ccaa009e;
     const K5_512: i64 = 0x163cd6124;
 
     // Barrett reduction
@@ -201,27 +234,21 @@ mod avx512 {
         r
     }
 
-    // Fold 512 bits using VPCLMULQDQ (4 x 128-bit chunks in parallel)
     #[inline(always)]
     unsafe fn fold512(a: __m512i, b: __m512i, keys: __m512i) -> __m512i {
-        // VPCLMULQDQ with imm8=0x00: multiply low 64-bits of each 128-bit lane
-        // VPCLMULQDQ with imm8=0x11: multiply high 64-bits of each 128-bit lane
         let t1 = _mm512_clmulepi64_epi128::<0x00>(a, keys);
         let t2 = _mm512_clmulepi64_epi128::<0x11>(a, keys);
-        _mm512_ternarylogic_epi32::<0x96>(t1, t2, b)  // t1 ^ t2 ^ b
+        _mm512_ternarylogic_epi32::<0x96>(t1, t2, b)
     }
 
-    // Reduce 512 to 128 using folding
     unsafe fn reduce512_to_128(x: __m512i, k3k4: __m512i) -> __m128i {
         let k3k4_128 = _mm512_castsi512_si128(k3k4);
 
-        // Fold the 4 x 128-bit chunks
         let chunk0 = _mm512_extracti32x4_epi32::<0>(x);
         let chunk1 = _mm512_extracti32x4_epi32::<1>(x);
         let chunk2 = _mm512_extracti32x4_epi32::<2>(x);
         let chunk3 = _mm512_extracti32x4_epi32::<3>(x);
 
-        // Fold chunk0 with chunk1, chunk2 with chunk3
         let t1 = _mm_clmulepi64_si128::<0x00>(chunk0, k3k4_128);
         let t2 = _mm_clmulepi64_si128::<0x11>(chunk0, k3k4_128);
         let fold01 = _mm_xor_si128(_mm_xor_si128(t1, t2), chunk1);
@@ -230,7 +257,6 @@ mod avx512 {
         let t2 = _mm_clmulepi64_si128::<0x11>(chunk2, k3k4_128);
         let fold23 = _mm_xor_si128(_mm_xor_si128(t1, t2), chunk3);
 
-        // Final fold
         let t1 = _mm_clmulepi64_si128::<0x00>(fold01, k3k4_128);
         let t2 = _mm_clmulepi64_si128::<0x11>(fold01, k3k4_128);
         _mm_xor_si128(_mm_xor_si128(t1, t2), fold23)
@@ -239,25 +265,20 @@ mod avx512 {
     #[target_feature(enable = "avx512f", enable = "avx512vl", enable = "vpclmulqdq", enable = "sse4.1")]
     pub unsafe fn calculate(crc: u32, mut data: &[u8]) -> u32 {
         if data.len() < 256 {
-            // Fallback to SSE for medium chunks
             return sse::calculate(crc, data);
         }
 
-        // Load first 4 x 512 bits (256 bytes)
         let mut x3 = get512(&mut data);
         let mut x2 = get512(&mut data);
         let mut x1 = get512(&mut data);
         let mut x0 = get512(&mut data);
 
-        // Fold in initial CRC to first 128-bit chunk of x3
         let crc_128 = _mm_cvtsi32_si128(!crc as i32);
         let crc_512 = _mm512_castsi128_si512(crc_128);
         x3 = _mm512_xor_si512(x3, crc_512);
 
-        // Folding constants
         let k1k2 = _mm512_set_epi64(K2_512, K1_512, K2_512, K1_512, K2_512, K1_512, K2_512, K1_512);
 
-        // Main loop: fold 256 bytes per iteration
         while data.len() >= 256 {
             x3 = fold512(x3, get512(&mut data), k1k2);
             x2 = fold512(x2, get512(&mut data), k1k2);
@@ -265,21 +286,17 @@ mod avx512 {
             x0 = fold512(x0, get512(&mut data), k1k2);
         }
 
-        // Fold 4 -> 1
         let k3k4 = _mm512_set_epi64(K4_512, K3_512, K4_512, K3_512, K4_512, K3_512, K4_512, K3_512);
         let mut x = fold512(x3, x2, k3k4);
         x = fold512(x, x1, k3k4);
         x = fold512(x, x0, k3k4);
 
-        // Fold remaining 64-byte chunks
         while data.len() >= 64 {
             x = fold512(x, get512(&mut data), k3k4);
         }
 
-        // Reduce 512 -> 128
         let mut x128 = reduce512_to_128(x, k3k4);
 
-        // Process remaining 16-byte chunks
         let k3k4_128 = _mm_set_epi64x(K4_512, K3_512);
         while data.len() >= 16 {
             let chunk = _mm_loadu_si128(data.as_ptr() as *const __m128i);
@@ -289,7 +306,6 @@ mod avx512 {
             data = &data[16..];
         }
 
-        // Reduce 128 -> 64
         let x128 = _mm_xor_si128(
             _mm_clmulepi64_si128::<0x10>(x128, k3k4_128),
             _mm_srli_si128(x128, 8),
@@ -302,7 +318,6 @@ mod avx512 {
             _mm_srli_si128(x128, 4),
         );
 
-        // Barrett reduction: 64 -> 32
         let pu = _mm_set_epi64x(U_PRIME, P_X);
         let t1 = _mm_clmulepi64_si128::<0x10>(
             _mm_and_si128(x128, _mm_set_epi32(0, 0, 0, !0)),
@@ -319,12 +334,11 @@ mod avx512 {
 }
 
 // ============================================================================
-// Public API with runtime dispatch
+// Single-threaded implementation
 // ============================================================================
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub fn crc32(data: &[u8]) -> u32 {
-    // Check for AVX-512 support
+pub fn crc32_single(data: &[u8]) -> u32 {
     if is_x86_feature_detected!("avx512f")
         && is_x86_feature_detected!("avx512vl")
         && is_x86_feature_detected!("vpclmulqdq")
@@ -342,8 +356,61 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-pub fn crc32(data: &[u8]) -> u32 {
+pub fn crc32_single(data: &[u8]) -> u32 {
     crc32_slice8(0, data)
+}
+
+// ============================================================================
+// Parallel implementation (rayon)
+// ============================================================================
+#[cfg(feature = "parallel")]
+pub fn crc32_parallel(data: &[u8]) -> u32 {
+    use rayon::prelude::*;
+
+    // Threshold: only use parallel for data > 1MB
+    const PARALLEL_THRESHOLD: usize = 1 << 20;
+
+    if data.len() < PARALLEL_THRESHOLD {
+        return crc32_single(data);
+    }
+
+    // Split into chunks of at least 64KB each
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (data.len() / num_threads).max(64 * 1024);
+
+    // Compute CRCs in parallel
+    let chunks: Vec<(u32, usize)> = data
+        .par_chunks(chunk_size)
+        .map(|chunk| (crc32_single(chunk), chunk.len()))
+        .collect();
+
+    // Combine results: crc(a||b) = combine(crc(a), crc(b), len(b))
+    // We combine left-to-right, passing the length of the right chunk
+    if chunks.is_empty() {
+        return 0;
+    }
+
+    let mut result = chunks[0].0;
+    for i in 1..chunks.len() {
+        result = crc32_combine(result, chunks[i].0, chunks[i].1 as u64);
+    }
+
+    result
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+#[cfg(feature = "parallel")]
+#[inline]
+pub fn crc32(data: &[u8]) -> u32 {
+    crc32_parallel(data)
+}
+
+#[cfg(not(feature = "parallel"))]
+#[inline]
+pub fn crc32(data: &[u8]) -> u32 {
+    crc32_single(data)
 }
 
 #[cfg(test)]
@@ -369,9 +436,21 @@ mod tests {
         assert_eq!(crc32(&test_data), crc32fast::hash(&test_data));
     }
     #[test]
-    fn test_avx512_path() {
-        // Large enough to trigger AVX-512 path
-        let test_data: Vec<u8> = (0..=255u8).cycle().take(1_000_000).collect();
+    fn test_combine() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+        let mid = data.len() / 2;
+
+        let crc_full = crc32(&data);
+        let crc1 = crc32(&data[..mid]);
+        let crc2 = crc32(&data[mid..]);
+        let combined = crc32_combine(crc1, crc2, (data.len() - mid) as u64);
+
+        assert_eq!(crc_full, combined);
+    }
+    #[test]
+    fn test_parallel_path() {
+        // Large enough to trigger parallel path
+        let test_data: Vec<u8> = (0..=255u8).cycle().take(2_000_000).collect();
         assert_eq!(crc32(&test_data), crc32fast::hash(&test_data));
     }
 }

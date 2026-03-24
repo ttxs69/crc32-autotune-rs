@@ -106,6 +106,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "rand",
+ "rayon",
 ]
 
 [[package]]

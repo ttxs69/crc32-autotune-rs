@@ -6,11 +6,16 @@ description = "CRC32 performance auto-optimization using AI agents"
 authors = ["AutoResearch"]
 
 [dependencies]
+rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 crc32fast = "1.4"
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
 
 [[bench]]
 name = "benchmark"
