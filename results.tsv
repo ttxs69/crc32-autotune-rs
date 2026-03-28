@@ -1,1 +1,2 @@
 commit	throughput_mb_s	status	description
+c0e9181	7800	baseline	current implementation (SIMD + slice-by-8 + parallel)
