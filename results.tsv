@@ -1,4 +1,4 @@
 commit	throughput_mb_s	status	description
 c0e9181	7800	baseline	current implementation (SIMD + slice-by-8 + parallel)
 4d70a79	41000	keep	aarch64 hw CRC32 (4-way interleave, 16KiB threshold): single 1.8->22 GiB/s, 100MB parallel 7.9->41 GiB/s
-TBD2	44500	keep	tuning: >32MiB caps parallel streams at 4 (100MB 35.6->44.5 GiB/s), PMULL down to 192B, X2N period-32 closure verified+tested (combine exact >=4GiB)
+98d63f4	44500	keep	tuning: >32MiB caps parallel streams at 4 (100MB 35.6->44.5 GiB/s), PMULL down to 192B, X2N period-32 closure verified+tested (combine exact >=4GiB)
