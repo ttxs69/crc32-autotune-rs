@@ -334,6 +334,150 @@ mod avx512 {
 }
 
 // ============================================================================
+// aarch64 NEON implementation (PMULL folding)
+// ============================================================================
+// Port of the Intel "fast CRC computation for generic polynomials using
+// PCLMULQDQ" technique to NEON: 128-bit vectors folded with carry-less
+// multiplies (vmull_p64), then Barrett reduction. Same folding constants
+// as the x86 SSE path (polynomial constants are architecture-independent).
+//
+// Unlike the x86 modules, this path is exercised and verified by the test
+// suite on aarch64 hardware.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::*;
+    use std::arch::aarch64::*;
+
+    // Folding constants (CRC32-IEEE, reflected)
+    const K1: u64 = 0x154442bd4;
+    const K2: u64 = 0x1c6e41596;
+    const K3: u64 = 0x1751997d0;
+    const K4: u64 = 0x0ccaa009e;
+    const K5: u64 = 0x163cd6124;
+
+    // Barrett reduction constants
+    const P_X: u64 = 0x1DB710641;
+    const U_PRIME: u64 = 0x1F7011641;
+
+    /// Minimum length for the folding path; below it the hardware CRC32
+    /// chain (or slice-by-8) wins on start-up cost. Tuned by measurement.
+    pub const MIN_LEN: usize = 256;
+
+    type V = uint64x2_t; // 128-bit vector
+
+    #[inline(always)]
+    unsafe fn load(data: &mut &[u8]) -> V {
+        debug_assert!(data.len() >= 16);
+        let r = vld1q_u64(data.as_ptr() as *const u64);
+        *data = &data[16..];
+        r
+    }
+
+    /// Carry-less multiply of the low 64-bit lanes (pclmulqdq imm 0x00).
+    #[inline(always)]
+    unsafe fn clmul_lo(a: V, b: V) -> V {
+        vreinterpretq_u64_p128(vmull_p64(
+            vgetq_lane_p64::<0>(vreinterpretq_p64_u64(a)),
+            vgetq_lane_p64::<0>(vreinterpretq_p64_u64(b)),
+        ))
+    }
+
+    /// Carry-less multiply of the high 64-bit lanes (pclmulqdq imm 0x11).
+    #[inline(always)]
+    unsafe fn clmul_hi(a: V, b: V) -> V {
+        vreinterpretq_u64_p128(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ))
+    }
+
+    /// Carry-less multiply of the low lane of `a` with scalar constant `k`.
+    #[inline(always)]
+    unsafe fn clmul_k(a: V, k: u64) -> V {
+        let kv = vreinterpretq_p64_u64(vdupq_n_u64(k));
+        vreinterpretq_u64_p128(vmull_p64(
+            vgetq_lane_p64::<0>(vreinterpretq_p64_u64(a)),
+            vgetq_lane_p64::<0>(kv),
+        ))
+    }
+
+    /// x = (x_lo * keys_lo) ^ (x_hi * keys_hi) ^ b  (carry-less products)
+    #[inline(always)]
+    unsafe fn fold(a: V, b: V, keys: V) -> V {
+        veorq_u64(veorq_u64(b, clmul_lo(a, keys)), clmul_hi(a, keys))
+    }
+
+    #[target_feature(enable = "aes")] // vmull_p64 is in the AES feature group
+    pub unsafe fn calculate(crc: u32, mut data: &[u8]) -> u32 {
+        if data.len() < 256 {
+            return crc32_slice8(crc, data);
+        }
+
+        // Stream order: x3 holds the oldest 16 bytes (gets the initial crc).
+        let mut x3 = load(&mut data);
+        let mut x2 = load(&mut data);
+        let mut x1 = load(&mut data);
+        let mut x0 = load(&mut data);
+
+        // XOR the (inverted) initial crc into the low 32 bits of the first block
+        // (zero-extended, like _mm_cvtsi32_si128 — NOT broadcast).
+        x3 = veorq_u64(
+            x3,
+            vcombine_u64(vdup_n_u64(!crc as u64), vdup_n_u64(0)),
+        );
+
+        // Fold by 4: consume 64 bytes per iteration.
+        let k1k2 = vcombine_u64(vdup_n_u64(K1), vdup_n_u64(K2));
+        while data.len() >= 64 {
+            x3 = fold(x3, load(&mut data), k1k2);
+            x2 = fold(x2, load(&mut data), k1k2);
+            x1 = fold(x1, load(&mut data), k1k2);
+            x0 = fold(x0, load(&mut data), k1k2);
+        }
+
+        // Fold the four accumulators into one.
+        let k3k4 = vcombine_u64(vdup_n_u64(K3), vdup_n_u64(K4));
+        let mut x = fold(x3, x2, k3k4);
+        x = fold(x, x1, k3k4);
+        x = fold(x, x0, k3k4);
+
+        // Fold remaining whole 16-byte blocks.
+        while data.len() >= 16 {
+            x = fold(x, load(&mut data), k3k4);
+        }
+
+        // Reduce 128 -> 64: x = (x_lo * K4) ^ (x_hi << 64)
+        let t = clmul_k(x, K4);
+        let hi = vcombine_u64(vdup_n_u64(vgetq_lane_u64(x, 1)), vdup_n_u64(0));
+        let x = veorq_u64(t, hi);
+
+        // Reduce 64 -> 32: x = (x_lo32 * K5) ^ (x shifted right 4 bytes)
+        let x_lo32 = vandq_u64(x, vdupq_n_u64(0xFFFF_FFFF));
+        let t = clmul_k(x_lo32, K5);
+        // byte-shift right by 4: (x_u32[1], x_u32[2], x_u32[3], 0)
+        let shifted = vreinterpretq_u64_u32(vextq_u32(
+            vreinterpretq_u32_u64(x),
+            vdupq_n_u32(0),
+            1,
+        ));
+        let x = veorq_u64(t, shifted);
+
+        // Barrett reduction 32: x_lo32 * U', then * P, keep bits [63:32]
+        let x_lo = vandq_u64(x, vdupq_n_u64(0xFFFF_FFFF));
+        let t1 = clmul_k(x_lo, U_PRIME);
+        let t1_lo = vandq_u64(t1, vdupq_n_u64(0xFFFF_FFFF));
+        let t2 = clmul_k(t1_lo, P_X);
+        let c = vgetq_lane_u32(vreinterpretq_u32_u64(veorq_u64(x, t2)), 1);
+
+        if !data.is_empty() {
+            crc32_slice8(!c, data)
+        } else {
+            !c
+        }
+    }
+}
+
+// ============================================================================
 // aarch64 implementation (hardware CRC32 instructions)
 // ============================================================================
 // ARMv8 provides CRC32B/H/W/X instructions for the IEEE polynomial (the same
@@ -346,9 +490,13 @@ mod arm {
     use super::*;
     use std::arch::aarch64::*;
 
-    /// Minimum size for the 4-way interleaved path (below it the folding
+    /// Minimum length for the 4-way interleaved path (below it the folding
     /// overhead outweighs the ILP win; the serial chain is already fast).
-    const INTERLEAVE_THRESHOLD: usize = 16 * 1024;
+    /// Also used by the top-level dispatcher as the upper bound of the NEON
+    /// PMULL path: on M1 the hardware CRC32 4-way interleave (≈23 GiB/s)
+    /// beats PMULL folding (≈17 GiB/s) above this size, while PMULL beats
+    /// the serial chain (≈5 GiB/s) everywhere above 256 B.
+    pub const INTERLEAVE_THRESHOLD: usize = 24 * 1024;
 
     #[inline(always)]
     unsafe fn read_u64(p: *const u8) -> u64 {
@@ -358,7 +506,7 @@ mod arm {
     /// Serial hardware-CRC chain over `data`, starting from the internal
     /// (pre-inverted) state. Returns the internal state.
     #[inline(always)]
-    unsafe fn chain(mut state: u32, mut data: &[u8]) -> u32 {
+    unsafe fn chain(mut state: u32, data: &[u8]) -> u32 {
         let mut ptr = data.as_ptr();
         let mut len = data.len();
         while len >= 8 {
@@ -464,7 +612,15 @@ pub fn crc32_single(data: &[u8]) -> u32 {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn crc32_single(data: &[u8]) -> u32 {
-    if std::arch::is_aarch64_feature_detected!("crc") {
+    let len = data.len();
+    // PMULL folding for small/medium inputs (needs FEAT_PMULL, detected as
+    // "aes"); 4-way interleaved hardware CRC above the crossover point.
+    if len >= neon::MIN_LEN
+        && len < arm::INTERLEAVE_THRESHOLD
+        && std::arch::is_aarch64_feature_detected!("aes")
+    {
+        unsafe { neon::calculate(0, data) }
+    } else if std::arch::is_aarch64_feature_detected!("crc") {
         unsafe { arm::calculate(0, data) }
     } else {
         crc32_slice8(0, data)
@@ -700,8 +856,8 @@ mod tests {
         // and exercise various tail/segment lengths. All below the parallel
         // threshold so crc32_single is what gets tested.
         for &size in &[
-            10_000usize, 16_383, 16_384, 16_391, 65_536, 131_072, 131_080, 200_003, 262_144,
-            262_157, 500_009, 1_048_575,
+            10_000usize, 255, 256, 257, 16_383, 16_384, 16_391, 24_575, 24_577, 65_536, 131_072,
+            131_080, 200_003, 262_144, 262_157, 500_009, 1_048_575,
         ] {
             let data: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
             assert_eq!(
