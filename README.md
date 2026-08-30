@@ -9,10 +9,11 @@
 | 输入大小 | 单线程 | 说明 |
 |---|---|---|
 | < 192 B | ~5 GiB/s | 硬件 CRC32 串行链 |
-| ≥ 192 B | 16–33 GiB/s | NEON PMULL 折叠（双 fold-by-4 组 + 裸指针装载） |
+| ≥ 192 B | 16–53 GiB/s | NEON PMULL 折叠，双组交织循环（8 独立链，PMULL 利用率 92%） |
 
-- 多线程（rayon，> 1 MiB）：1MB ~34 GiB/s，10MB ~70 GiB/s，100MB ~45 GiB/s（DRAM 受限）
-- 对比 crc32fast：单线程 2–4×，多线程最高 13×（1GB）
+- 距 libdeflate（公认最快单线程实现）仅差 ~10%；多线程远超它
+- 多线程（rayon，> 1 MiB）：1MB ~36 GiB/s，10MB ~78 GiB/s，100MB ~46 GiB/s（DRAM 受限）
+- 对比 crc32fast：单线程 3–10×，1GB 场景 ~9–13×
 - x86_64 上另有 PCLMULQDQ（SSE）与 AVX-512 VPCLMULQDQ 路径（结构经标量 oracle 验证）
 - 100MB 档受 DRAM 带宽限制；>32MiB 输入自动减少并发流数以降低 DRAM 争用
 

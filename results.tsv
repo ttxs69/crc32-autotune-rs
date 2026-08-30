@@ -3,3 +3,4 @@ c0e9181	7800	baseline	current implementation (SIMD + slice-by-8 + parallel)
 4d70a79	41000	keep	aarch64 hw CRC32 (4-way interleave, 16KiB threshold): single 1.8->22 GiB/s, 100MB parallel 7.9->41 GiB/s
 98d63f4	44500	keep	tuning: >32MiB caps parallel streams at 4 (100MB 35.6->44.5 GiB/s), PMULL down to 192B, X2N period-32 closure verified+tested (combine exact >=4GiB)
 4ffac1c	45100	keep	PMULL rewrite: raw-pointer 128B-unrolled fold loop + dual fold-by-4 groups => PMULL for all >=192B; 64KB single 22->33 GiB/s, 10MB 54->70, 1GB 13.2x crc32fast. hw-crc 8-way kept as no-PMULL fallback
+TBD4	53500	keep	interleaved dual-group fold2x: the two fold-by-4 groups now run in ONE loop (8 chains in flight) instead of sequentially => 64KB single 33->53.5 GiB/s (92% of PMULL unit), 10MB 78.4. Gap to libdeflate ~10%. Mixed PMULL+CRC32X probe: units contend, hybrid rejected

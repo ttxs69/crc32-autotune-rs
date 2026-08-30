@@ -415,18 +415,101 @@ mod neon {
 
     #[target_feature(enable = "aes")] // vmull_p64 is in the AES feature group
     pub unsafe fn calculate(crc: u32, data: &[u8]) -> u32 {
-        // Two independent fold-by-4 groups (8 chains total) hide PMULL
-        // latency; halves are combined with crc32_combine. Measured on M1:
-        // 8 chains is the sweet spot (16 chains via 4 groups regressed,
-        // likely on register pressure / load saturation).
+        // Two fold-by-4 groups run in ONE interleaved loop (8 accumulators
+        // in flight) to hide PMULL latency; partials are combined with
+        // crc32_combine. Interleaving matters: calling fold128(h0) then
+        // fold128(h1) runs the two groups' loops sequentially and leaves
+        // the PMULL unit half idle.
         if data.len() >= 1024 {
             let n = (data.len() / 2) & !15;
             let (h0, h1) = data.split_at(n);
-            let c0 = fold128(crc, h0);
-            let c1 = fold128(0, h1);
+            let (c0, c1) = fold2x(crc, h0, h1);
             return crc32_combine(c0, c1, h1.len() as u64);
         }
         fold128(crc, data)
+    }
+
+    /// Two fold-by-4 groups in one interleaved loop. Each iteration folds
+    /// 128 bytes (8 x 16B blocks, 16 PMULLs) with all 8 chains independent.
+    #[target_feature(enable = "aes")]
+    unsafe fn fold2x(crc: u32, mut a: &[u8], mut b: &[u8]) -> (u32, u32) {
+        debug_assert!(a.len() >= 128 && b.len() >= 128);
+        let mut a3 = load(&mut a);
+        let mut a2 = load(&mut a);
+        let mut a1 = load(&mut a);
+        let mut a0 = load(&mut a);
+        let mut b3 = load(&mut b);
+        let mut b2 = load(&mut b);
+        let mut b1 = load(&mut b);
+        let mut b0 = load(&mut b);
+
+        a3 = veorq_u64(
+            a3,
+            vcombine_u64(vdup_n_u64(!crc as u64), vdup_n_u64(0)),
+        );
+        // Group b is a fresh CRC (initial value 0): inject the standard
+        // !0 init into its first block, like fold128(0, ..) does.
+        b3 = veorq_u64(
+            b3,
+            vcombine_u64(vdup_n_u64(0xFFFF_FFFF), vdup_n_u64(0)),
+        );
+
+        let k1k2 = vcombine_u64(vdup_n_u64(K1), vdup_n_u64(K2));
+        while a.len() >= 64 && b.len() >= 64 {
+            a3 = fold(a3, load(&mut a), k1k2);
+            b3 = fold(b3, load(&mut b), k1k2);
+            a2 = fold(a2, load(&mut a), k1k2);
+            b2 = fold(b2, load(&mut b), k1k2);
+            a1 = fold(a1, load(&mut a), k1k2);
+            b1 = fold(b1, load(&mut b), k1k2);
+            a0 = fold(a0, load(&mut a), k1k2);
+            b0 = fold(b0, load(&mut b), k1k2);
+        }
+        (reduce_group(a3, a2, a1, a0, a), reduce_group(b3, b2, b1, b0, b))
+    }
+
+    /// Fold the four accumulators into one, finish remaining 16-byte
+    /// blocks, then run the 128->64->32 reductions and Barrett.
+    #[target_feature(enable = "aes")]
+    unsafe fn reduce_group(x3: V, x2: V, x1: V, x0: V, mut data: &[u8]) -> u32 {
+        // Fold the four accumulators into one.
+        let k3k4 = vcombine_u64(vdup_n_u64(K3), vdup_n_u64(K4));
+        let mut x = fold(x3, x2, k3k4);
+        x = fold(x, x1, k3k4);
+        x = fold(x, x0, k3k4);
+
+        // Fold remaining whole 16-byte blocks.
+        while data.len() >= 16 {
+            x = fold(x, load(&mut data), k3k4);
+        }
+
+        // Reduce 128 -> 64: x = (x_lo * K4) ^ (x_hi << 64)
+        let t = clmul_k(x, K4);
+        let hi = vcombine_u64(vdup_n_u64(vgetq_lane_u64(x, 1)), vdup_n_u64(0));
+        let x = veorq_u64(t, hi);
+
+        // Reduce 64 -> 32: x = (x_lo32 * K5) ^ (x shifted right 4 bytes)
+        let x_lo32 = vandq_u64(x, vdupq_n_u64(0xFFFF_FFFF));
+        let t = clmul_k(x_lo32, K5);
+        let shifted = vreinterpretq_u64_u32(vextq_u32(
+            vreinterpretq_u32_u64(x),
+            vdupq_n_u32(0),
+            1,
+        ));
+        let x = veorq_u64(t, shifted);
+
+        // Barrett reduction 32: x_lo32 * U', then * P, keep bits [63:32]
+        let x_lo = vandq_u64(x, vdupq_n_u64(0xFFFF_FFFF));
+        let t1 = clmul_k(x_lo, U_PRIME);
+        let t1_lo = vandq_u64(t1, vdupq_n_u64(0xFFFF_FFFF));
+        let t2 = clmul_k(t1_lo, P_X);
+        let c = vgetq_lane_u32(vreinterpretq_u32_u64(veorq_u64(x, t2)), 1);
+
+        if !data.is_empty() {
+            crc32_slice8(!c, data)
+        } else {
+            !c
+        }
     }
 
     /// Single fold-by-4 group over 128-bit vectors, then Barrett reduction.
@@ -475,46 +558,7 @@ mod neon {
             remaining -= 64;
         }
         data = std::slice::from_raw_parts(p, remaining);
-
-        // Fold the four accumulators into one.
-        let k3k4 = vcombine_u64(vdup_n_u64(K3), vdup_n_u64(K4));
-        let mut x = fold(x3, x2, k3k4);
-        x = fold(x, x1, k3k4);
-        x = fold(x, x0, k3k4);
-
-        // Fold remaining whole 16-byte blocks.
-        while data.len() >= 16 {
-            x = fold(x, load(&mut data), k3k4);
-        }
-
-        // Reduce 128 -> 64: x = (x_lo * K4) ^ (x_hi << 64)
-        let t = clmul_k(x, K4);
-        let hi = vcombine_u64(vdup_n_u64(vgetq_lane_u64(x, 1)), vdup_n_u64(0));
-        let x = veorq_u64(t, hi);
-
-        // Reduce 64 -> 32: x = (x_lo32 * K5) ^ (x shifted right 4 bytes)
-        let x_lo32 = vandq_u64(x, vdupq_n_u64(0xFFFF_FFFF));
-        let t = clmul_k(x_lo32, K5);
-        // byte-shift right by 4: (x_u32[1], x_u32[2], x_u32[3], 0)
-        let shifted = vreinterpretq_u64_u32(vextq_u32(
-            vreinterpretq_u32_u64(x),
-            vdupq_n_u32(0),
-            1,
-        ));
-        let x = veorq_u64(t, shifted);
-
-        // Barrett reduction 32: x_lo32 * U', then * P, keep bits [63:32]
-        let x_lo = vandq_u64(x, vdupq_n_u64(0xFFFF_FFFF));
-        let t1 = clmul_k(x_lo, U_PRIME);
-        let t1_lo = vandq_u64(t1, vdupq_n_u64(0xFFFF_FFFF));
-        let t2 = clmul_k(t1_lo, P_X);
-        let c = vgetq_lane_u32(vreinterpretq_u32_u64(veorq_u64(x, t2)), 1);
-
-        if !data.is_empty() {
-            crc32_slice8(!c, data)
-        } else {
-            !c
-        }
+        reduce_group(x3, x2, x1, x0, data)
     }
 }
 

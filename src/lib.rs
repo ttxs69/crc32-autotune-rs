@@ -30,11 +30,13 @@
 //!
 //! Measured on Apple M1 (aarch64). Single-threaded dispatch:
 //! - < 192 B: hardware CRC32 serial chain, ~5 GiB/s
-//! - >= 192 B: NEON PMULL folding (dual fold-by-4 groups, pointer loads),
-//!   ~16 GiB/s at 1 KiB rising to ~33 GiB/s at 64 KiB (2-4x crc32fast)
+//! - >= 192 B: NEON PMULL folding with two interleaved fold-by-4 groups
+//!   (8 independent chains, ~2.25 of the PMULL unit's ~2.45 ops/cycle):
+//!   ~16 GiB/s at 1 KiB rising to ~53 GiB/s at 64 KiB — within ~10% of
+//!   libdeflate, the fastest known single-threaded implementation
 //!
-//! Multi-threaded (rayon, > 1 MiB): ~34 GiB/s (1 MiB), ~70 GiB/s (10 MiB),
-//! ~45 GiB/s (100 MiB, DRAM-bound). 1 GiB input: ~13x crc32fast.
+//! Multi-threaded (rayon, > 1 MiB): ~36 GiB/s (1 MiB), ~78 GiB/s (10 MiB),
+//! ~46 GiB/s (100 MiB, DRAM-bound).
 //! Hardware-CRC interleave and slice-by-8 remain as fallbacks for cores
 //! without PMULL.
 //! Note: the criterion bench inflates small-size numbers for pure callees
