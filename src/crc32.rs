@@ -39,7 +39,14 @@ const S8: [[u32; 256]; 8] = {
     t
 };
 
-// Pre-computed x^(2^n) mod poly for combine operation
+// Pre-computed x^(2^n) mod poly for combine operation.
+//
+// This is a doubling chain: entry[i+1] == gf2_multiply(entry[i], entry[i]),
+// and it closes with period 32: gf2_multiply(entry[31], entry[31]) == entry[0]
+// (verified numerically; follows from the CRC32 polynomial being primitive).
+// That closure is what makes crc32_combine's `i & 0x1F` index wrap exact
+// for len2 >= 2^32 (e.g. parallel hashing of inputs larger than 4 GiB).
+// test_x2n_table_closure pins these properties.
 static X2N_TABLE: [u32; 32] = [
     0x00800000, 0x00008000, 0xedb88320, 0xb1e6b092, 0xa06a2517, 0xed627dae, 0x88d14467, 0xd7bbfe6a,
     0xec447f11, 0x8e7ea170, 0x6427800e, 0x4d47bae0, 0x09fe548f, 0x83852d0f, 0x30362f1a, 0x7b5a9cc3,
@@ -361,7 +368,7 @@ mod neon {
 
     /// Minimum length for the folding path; below it the hardware CRC32
     /// chain (or slice-by-8) wins on start-up cost. Tuned by measurement.
-    pub const MIN_LEN: usize = 256;
+    pub const MIN_LEN: usize = 192;
 
     type V = uint64x2_t; // 128-bit vector
 
@@ -409,7 +416,7 @@ mod neon {
 
     #[target_feature(enable = "aes")] // vmull_p64 is in the AES feature group
     pub unsafe fn calculate(crc: u32, mut data: &[u8]) -> u32 {
-        if data.len() < 256 {
+        if data.len() < 128 {
             return crc32_slice8(crc, data);
         }
 
@@ -647,9 +654,18 @@ pub fn crc32_parallel(data: &[u8]) -> u32 {
         return crc32_single(data);
     }
 
-    // Split into chunks of at least 64KB each
+    // Split into chunks of at least 64KB each.
     let num_threads = rayon::current_num_threads().max(1);
-    let chunk_size = (data.len() / num_threads).max(64 * 1024);
+    // For DRAM-bandwidth-bound sizes (> 32 MiB, beyond LLC), a few large
+    // streams beat many small ones: on big.LITTLE-style chips the slow cores'
+    // extra streams increase DRAM contention more than they add throughput
+    // (measured on M1: 4 x 25MB chunks ~41-46 GiB/s vs 8 x 12.5MB ~35).
+    let num_chunks = if data.len() >= 33_554_432 {
+        num_threads.min(4)
+    } else {
+        num_threads
+    };
+    let chunk_size = (data.len() / num_chunks).max(64 * 1024);
 
     // Compute CRCs in parallel
     let chunks: Vec<(u32, usize)> = data
@@ -851,13 +867,23 @@ mod tests {
         assert_eq!(direct, incremental);
     }
     #[test]
+    fn test_x2n_table_closure() {
+        // Doubling chain consistency (spot checks) ...
+        for i in 0..31 {
+            assert_eq!(gf2_multiply(X2N_TABLE[i], X2N_TABLE[i]), X2N_TABLE[i + 1], "chain broken at {i}");
+        }
+        // ... and period-32 closure, which makes the `i & 0x1F` wrap in
+        // crc32_combine exact for len2 >= 2^32.
+        assert_eq!(gf2_multiply(X2N_TABLE[31], X2N_TABLE[31]), X2N_TABLE[0]);
+    }
+    #[test]
     fn test_single_thread_hw_paths() {
         // Sizes chosen to cross the aarch64 interleave threshold (16 KiB)
         // and exercise various tail/segment lengths. All below the parallel
         // threshold so crc32_single is what gets tested.
         for &size in &[
-            10_000usize, 255, 256, 257, 16_383, 16_384, 16_391, 24_575, 24_577, 65_536, 131_072,
-            131_080, 200_003, 262_144, 262_157, 500_009, 1_048_575,
+            10_000usize, 127, 191, 192, 193, 255, 256, 257, 16_383, 16_384, 16_391, 24_575, 24_577,
+            65_536, 131_072, 131_080, 200_003, 262_144, 262_157, 500_009, 1_048_575,
         ] {
             let data: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
             assert_eq!(
