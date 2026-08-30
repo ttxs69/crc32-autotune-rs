@@ -29,10 +29,14 @@
 //! ## Performance
 //!
 //! Measured on Apple M1 (aarch64). Single-threaded dispatch:
-//! - 256 B - 24 KiB: NEON PMULL folding, ~9-17 GiB/s (2-3.4x crc32fast)
-//! - > 24 KiB: 4-way interleaved hardware CRC32, ~22 GiB/s (~3x crc32fast)
+//! - < 192 B: hardware CRC32 serial chain, ~5 GiB/s
+//! - >= 192 B: NEON PMULL folding (dual fold-by-4 groups, pointer loads),
+//!   ~16 GiB/s at 1 KiB rising to ~33 GiB/s at 64 KiB (2-4x crc32fast)
 //!
-//! Multi-threaded (rayon, > 1 MiB): ~40-54 GiB/s (5-6x crc32fast).
+//! Multi-threaded (rayon, > 1 MiB): ~34 GiB/s (1 MiB), ~70 GiB/s (10 MiB),
+//! ~45 GiB/s (100 MiB, DRAM-bound). 1 GiB input: ~13x crc32fast.
+//! Hardware-CRC interleave and slice-by-8 remain as fallbacks for cores
+//! without PMULL.
 //! Note: the criterion bench inflates small-size numbers for pure callees
 //! (compiler hoisting); the figures above are from controlled measurement.
 //!

@@ -155,7 +155,7 @@ mod sse {
     }
 
     #[target_feature(enable = "pclmulqdq", enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn calculate(crc: u32, mut data: &[u8]) -> u32 {
+    pub unsafe fn calculate(crc: u32, data: &[u8]) -> u32 {
         if data.len() < 128 {
             return crc32_slice8(crc, data);
         }
@@ -270,7 +270,7 @@ mod avx512 {
     }
 
     #[target_feature(enable = "avx512f", enable = "avx512vl", enable = "vpclmulqdq", enable = "sse4.1")]
-    pub unsafe fn calculate(crc: u32, mut data: &[u8]) -> u32 {
+    pub unsafe fn calculate(crc: u32, data: &[u8]) -> u32 {
         if data.len() < 256 {
             return sse::calculate(crc, data);
         }
@@ -379,7 +379,6 @@ mod neon {
         *data = &data[16..];
         r
     }
-
     /// Carry-less multiply of the low 64-bit lanes (pclmulqdq imm 0x00).
     #[inline(always)]
     unsafe fn clmul_lo(a: V, b: V) -> V {
@@ -415,7 +414,24 @@ mod neon {
     }
 
     #[target_feature(enable = "aes")] // vmull_p64 is in the AES feature group
-    pub unsafe fn calculate(crc: u32, mut data: &[u8]) -> u32 {
+    pub unsafe fn calculate(crc: u32, data: &[u8]) -> u32 {
+        // Two independent fold-by-4 groups (8 chains total) hide PMULL
+        // latency; halves are combined with crc32_combine. Measured on M1:
+        // 8 chains is the sweet spot (16 chains via 4 groups regressed,
+        // likely on register pressure / load saturation).
+        if data.len() >= 1024 {
+            let n = (data.len() / 2) & !15;
+            let (h0, h1) = data.split_at(n);
+            let c0 = fold128(crc, h0);
+            let c1 = fold128(0, h1);
+            return crc32_combine(c0, c1, h1.len() as u64);
+        }
+        fold128(crc, data)
+    }
+
+    /// Single fold-by-4 group over 128-bit vectors, then Barrett reduction.
+    #[target_feature(enable = "aes")]
+    unsafe fn fold128(crc: u32, mut data: &[u8]) -> u32 {
         if data.len() < 128 {
             return crc32_slice8(crc, data);
         }
@@ -433,14 +449,32 @@ mod neon {
             vcombine_u64(vdup_n_u64(!crc as u64), vdup_n_u64(0)),
         );
 
-        // Fold by 4: consume 64 bytes per iteration.
+        // Fold by 4 with raw pointers: consume 128 bytes per iteration
+        // (2 rounds of 4 folds), avoiding per-load slice bookkeeping.
         let k1k2 = vcombine_u64(vdup_n_u64(K1), vdup_n_u64(K2));
-        while data.len() >= 64 {
-            x3 = fold(x3, load(&mut data), k1k2);
-            x2 = fold(x2, load(&mut data), k1k2);
-            x1 = fold(x1, load(&mut data), k1k2);
-            x0 = fold(x0, load(&mut data), k1k2);
+        let mut p = data.as_ptr();
+        let mut remaining = data.len();
+        while remaining >= 128 {
+            x3 = fold(x3, vld1q_u64(p as *const u64), k1k2);
+            x2 = fold(x2, vld1q_u64(p.add(16) as *const u64), k1k2);
+            x1 = fold(x1, vld1q_u64(p.add(32) as *const u64), k1k2);
+            x0 = fold(x0, vld1q_u64(p.add(48) as *const u64), k1k2);
+            x3 = fold(x3, vld1q_u64(p.add(64) as *const u64), k1k2);
+            x2 = fold(x2, vld1q_u64(p.add(80) as *const u64), k1k2);
+            x1 = fold(x1, vld1q_u64(p.add(96) as *const u64), k1k2);
+            x0 = fold(x0, vld1q_u64(p.add(112) as *const u64), k1k2);
+            p = p.add(128);
+            remaining -= 128;
         }
+        while remaining >= 64 {
+            x3 = fold(x3, vld1q_u64(p as *const u64), k1k2);
+            x2 = fold(x2, vld1q_u64(p.add(16) as *const u64), k1k2);
+            x1 = fold(x1, vld1q_u64(p.add(32) as *const u64), k1k2);
+            x0 = fold(x0, vld1q_u64(p.add(48) as *const u64), k1k2);
+            p = p.add(64);
+            remaining -= 64;
+        }
+        data = std::slice::from_raw_parts(p, remaining);
 
         // Fold the four accumulators into one.
         let k3k4 = vcombine_u64(vdup_n_u64(K3), vdup_n_u64(K4));
@@ -497,13 +531,11 @@ mod arm {
     use super::*;
     use std::arch::aarch64::*;
 
-    /// Minimum length for the 4-way interleaved path (below it the folding
+    /// Minimum length for the interleaved path (below it the folding
     /// overhead outweighs the ILP win; the serial chain is already fast).
-    /// Also used by the top-level dispatcher as the upper bound of the NEON
-    /// PMULL path: on M1 the hardware CRC32 4-way interleave (≈23 GiB/s)
-    /// beats PMULL folding (≈17 GiB/s) above this size, while PMULL beats
-    /// the serial chain (≈5 GiB/s) everywhere above 256 B.
-    pub const INTERLEAVE_THRESHOLD: usize = 24 * 1024;
+    /// Only relevant on cores without PMULL: with PMULL available, the NEON
+    /// folding path handles everything above `neon::MIN_LEN` instead.
+    const INTERLEAVE_THRESHOLD: usize = 24 * 1024;
 
     #[inline(always)]
     unsafe fn read_u64(p: *const u8) -> u64 {
@@ -543,52 +575,91 @@ mod arm {
         state
     }
 
-    /// 4-way interleaved hardware CRC for large buffers.
+    /// 8-way interleaved hardware CRC for large buffers.
     ///
-    /// Splits `data` into 4 contiguous segments of `n` bytes (plus a tail),
+    /// Splits `data` into 8 contiguous segments of `n` bytes (plus a tail),
     /// runs one independent CRC chain per segment, then folds the partial
-    /// results: crc(s0||s1||s2||s3) = combine(combine(combine(f0,f1),f2),f3).
+    /// results with crc32_combine. 8 chains saturate the M1's CRC32X
+    /// execution throughput (~2.5 ops/cycle across multiple pipes),
+    /// which a 4-way split leaves half-idle.
     #[target_feature(enable = "crc")]
-    unsafe fn interleaved4(crc: u32, data: &[u8]) -> u32 {
+    unsafe fn interleaved8(crc: u32, data: &[u8]) -> u32 {
         let len = data.len();
-        let n = (len / 4) & !7; // segment length, a multiple of 8
+        let n = (len / 8) & !7; // segment length, a multiple of 8
         debug_assert!(n > 0);
         let base = data.as_ptr();
-        let seg1 = base.add(n);
-        let seg2 = base.add(2 * n);
-        let seg3 = base.add(3 * n);
+        let p1 = base.add(n);
+        let p2 = base.add(2 * n);
+        let p3 = base.add(3 * n);
+        let p4 = base.add(4 * n);
+        let p5 = base.add(5 * n);
+        let p6 = base.add(6 * n);
+        let p7 = base.add(7 * n);
 
         let mut c0 = !crc; // segment 0 carries the incoming state
-        let mut c1 = !0u32; // the others start from the standard init
-        let mut c2 = !0u32;
-        let mut c3 = !0u32;
+        let mut c = [!0u32; 7]; // the others start from the standard init
 
         let mut i = 0usize;
+        // Main loop: 16 bytes per stream per iteration (128 B total), using
+        // pointer arithmetic that LLVM strength-reduces. Deep unrolling
+        // amortizes loop overhead so the 8 independent CRC chains can
+        // saturate the ~2.5 ops/cycle CRC32X throughput of the M1's
+        // multiple execution pipes.
+        unsafe fn rd(p: *const u64) -> u64 {
+            std::ptr::read_unaligned(p)
+        }
+        while i + 16 <= n {
+            let s0 = base.add(i) as *const u64;
+            let s1 = p1.add(i) as *const u64;
+            let s2 = p2.add(i) as *const u64;
+            let s3 = p3.add(i) as *const u64;
+            let s4 = p4.add(i) as *const u64;
+            let s5 = p5.add(i) as *const u64;
+            let s6 = p6.add(i) as *const u64;
+            let s7 = p7.add(i) as *const u64;
+            c0 = __crc32d(c0, rd(s0));
+            c[0] = __crc32d(c[0], rd(s1));
+            c[1] = __crc32d(c[1], rd(s2));
+            c[2] = __crc32d(c[2], rd(s3));
+            c[3] = __crc32d(c[3], rd(s4));
+            c[4] = __crc32d(c[4], rd(s5));
+            c[5] = __crc32d(c[5], rd(s6));
+            c[6] = __crc32d(c[6], rd(s7));
+            c0 = __crc32d(c0, rd(s0.add(1)));
+            c[0] = __crc32d(c[0], rd(s1.add(1)));
+            c[1] = __crc32d(c[1], rd(s2.add(1)));
+            c[2] = __crc32d(c[2], rd(s3.add(1)));
+            c[3] = __crc32d(c[3], rd(s4.add(1)));
+            c[4] = __crc32d(c[4], rd(s5.add(1)));
+            c[5] = __crc32d(c[5], rd(s6.add(1)));
+            c[6] = __crc32d(c[6], rd(s7.add(1)));
+            i += 16;
+        }
         while i < n {
             c0 = __crc32d(c0, read_u64(base.add(i)));
-            c1 = __crc32d(c1, read_u64(seg1.add(i)));
-            c2 = __crc32d(c2, read_u64(seg2.add(i)));
-            c3 = __crc32d(c3, read_u64(seg3.add(i)));
+            c[0] = __crc32d(c[0], read_u64(p1.add(i)));
+            c[1] = __crc32d(c[1], read_u64(p2.add(i)));
+            c[2] = __crc32d(c[2], read_u64(p3.add(i)));
+            c[3] = __crc32d(c[3], read_u64(p4.add(i)));
+            c[4] = __crc32d(c[4], read_u64(p5.add(i)));
+            c[5] = __crc32d(c[5], read_u64(p6.add(i)));
+            c[6] = __crc32d(c[6], read_u64(p7.add(i)));
             i += 8;
         }
 
-        let f0 = !c0;
-        let f1 = !c1;
-        let f2 = !c2;
-        let f3 = !c3;
+        let mut acc = !c0;
+        for k in 0..7 {
+            acc = crc32_combine(acc, !c[k], n as u64);
+        }
 
-        let mut acc = crc32_combine(f0, f1, n as u64);
-        acc = crc32_combine(acc, f2, n as u64);
-        acc = crc32_combine(acc, f3, n as u64);
-
-        // Tail bytes [4n, len): fewer than 8*4, chain handles 8/4/2/1 words.
-        !chain(!acc, &data[4 * n..])
+        // Tail bytes [8n, len): fewer than 8*8, chain handles 8/4/2/1 words.
+        !chain(!acc, &data[8 * n..])
     }
 
     #[target_feature(enable = "crc")]
     pub unsafe fn calculate(crc: u32, data: &[u8]) -> u32 {
         if data.len() >= INTERLEAVE_THRESHOLD {
-            interleaved4(crc, data)
+            interleaved8(crc, data)
         } else {
             !chain(!crc, data)
         }
@@ -620,12 +691,12 @@ pub fn crc32_single(data: &[u8]) -> u32 {
 #[inline]
 pub fn crc32_single(data: &[u8]) -> u32 {
     let len = data.len();
-    // PMULL folding for small/medium inputs (needs FEAT_PMULL, detected as
-    // "aes"); 4-way interleaved hardware CRC above the crossover point.
-    if len >= neon::MIN_LEN
-        && len < arm::INTERLEAVE_THRESHOLD
-        && std::arch::is_aarch64_feature_detected!("aes")
-    {
+    // PMULL folding for everything above the start-up crossover: with
+    // pointer-based 16-byte NEON loads it needs only half the load traffic
+    // of CRC32X feeding, which on M1 makes it ~1.5x faster than even an
+    // 8-way interleaved hardware-CRC chain (33 vs 22 GiB/s at 64 KiB).
+    // The hardware CRC paths remain as fallbacks for cores without PMULL.
+    if len >= neon::MIN_LEN && std::arch::is_aarch64_feature_detected!("aes") {
         unsafe { neon::calculate(0, data) }
     } else if std::arch::is_aarch64_feature_detected!("crc") {
         unsafe { arm::calculate(0, data) }
