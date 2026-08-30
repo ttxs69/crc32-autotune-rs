@@ -334,6 +334,113 @@ mod avx512 {
 }
 
 // ============================================================================
+// aarch64 implementation (hardware CRC32 instructions)
+// ============================================================================
+// ARMv8 provides CRC32B/H/W/X instructions for the IEEE polynomial (the same
+// one used by crc32fast/zlib). A serial dependency chain on CRC32X runs at
+// ~8 bytes per 3 cycles; splitting the input into 4 contiguous segments with
+// independent chains hides that latency, then the partials are folded with
+// `crc32_combine`.
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use super::*;
+    use std::arch::aarch64::*;
+
+    /// Minimum size for the 4-way interleaved path (below it the folding
+    /// overhead outweighs the ILP win; the serial chain is already fast).
+    const INTERLEAVE_THRESHOLD: usize = 16 * 1024;
+
+    #[inline(always)]
+    unsafe fn read_u64(p: *const u8) -> u64 {
+        u64::from_le(std::ptr::read_unaligned(p as *const u64))
+    }
+
+    /// Serial hardware-CRC chain over `data`, starting from the internal
+    /// (pre-inverted) state. Returns the internal state.
+    #[inline(always)]
+    unsafe fn chain(mut state: u32, mut data: &[u8]) -> u32 {
+        let mut ptr = data.as_ptr();
+        let mut len = data.len();
+        while len >= 8 {
+            state = __crc32d(state, read_u64(ptr));
+            ptr = ptr.add(8);
+            len -= 8;
+        }
+        if len >= 4 {
+            state = __crc32w(
+                state,
+                u32::from_le(std::ptr::read_unaligned(ptr as *const u32)),
+            );
+            ptr = ptr.add(4);
+            len -= 4;
+        }
+        if len >= 2 {
+            state = __crc32h(
+                state,
+                u16::from_le(std::ptr::read_unaligned(ptr as *const u16)),
+            );
+            ptr = ptr.add(2);
+            len -= 2;
+        }
+        if len == 1 {
+            state = __crc32b(state, *ptr);
+        }
+        state
+    }
+
+    /// 4-way interleaved hardware CRC for large buffers.
+    ///
+    /// Splits `data` into 4 contiguous segments of `n` bytes (plus a tail),
+    /// runs one independent CRC chain per segment, then folds the partial
+    /// results: crc(s0||s1||s2||s3) = combine(combine(combine(f0,f1),f2),f3).
+    #[target_feature(enable = "crc")]
+    unsafe fn interleaved4(crc: u32, data: &[u8]) -> u32 {
+        let len = data.len();
+        let n = (len / 4) & !7; // segment length, a multiple of 8
+        debug_assert!(n > 0);
+        let base = data.as_ptr();
+        let seg1 = base.add(n);
+        let seg2 = base.add(2 * n);
+        let seg3 = base.add(3 * n);
+
+        let mut c0 = !crc; // segment 0 carries the incoming state
+        let mut c1 = !0u32; // the others start from the standard init
+        let mut c2 = !0u32;
+        let mut c3 = !0u32;
+
+        let mut i = 0usize;
+        while i < n {
+            c0 = __crc32d(c0, read_u64(base.add(i)));
+            c1 = __crc32d(c1, read_u64(seg1.add(i)));
+            c2 = __crc32d(c2, read_u64(seg2.add(i)));
+            c3 = __crc32d(c3, read_u64(seg3.add(i)));
+            i += 8;
+        }
+
+        let f0 = !c0;
+        let f1 = !c1;
+        let f2 = !c2;
+        let f3 = !c3;
+
+        let mut acc = crc32_combine(f0, f1, n as u64);
+        acc = crc32_combine(acc, f2, n as u64);
+        acc = crc32_combine(acc, f3, n as u64);
+
+        // Tail bytes [4n, len): fewer than 8*4, chain handles 8/4/2/1 words.
+        !chain(!acc, &data[4 * n..])
+    }
+
+    #[target_feature(enable = "crc")]
+    pub unsafe fn calculate(crc: u32, data: &[u8]) -> u32 {
+        if data.len() >= INTERLEAVE_THRESHOLD {
+            interleaved4(crc, data)
+        } else {
+            !chain(!crc, data)
+        }
+    }
+}
+
+// ============================================================================
 // Single-threaded implementation
 // ============================================================================
 #[cfg(target_arch = "x86_64")]
@@ -354,7 +461,17 @@ pub fn crc32_single(data: &[u8]) -> u32 {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn crc32_single(data: &[u8]) -> u32 {
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        unsafe { arm::calculate(0, data) }
+    } else {
+        crc32_slice8(0, data)
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline]
 pub fn crc32_single(data: &[u8]) -> u32 {
     crc32_slice8(0, data)
@@ -576,5 +693,22 @@ mod tests {
         let incremental = hasher.finish() as u32;
         
         assert_eq!(direct, incremental);
+    }
+    #[test]
+    fn test_single_thread_hw_paths() {
+        // Sizes chosen to cross the aarch64 interleave threshold (16 KiB)
+        // and exercise various tail/segment lengths. All below the parallel
+        // threshold so crc32_single is what gets tested.
+        for &size in &[
+            10_000usize, 16_383, 16_384, 16_391, 65_536, 131_072, 131_080, 200_003, 262_144,
+            262_157, 500_009, 1_048_575,
+        ] {
+            let data: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
+            assert_eq!(
+                crc32_single(&data),
+                crc32fast::hash(&data),
+                "mismatch at size {size}"
+            );
+        }
     }
 }

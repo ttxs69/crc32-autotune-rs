@@ -4,7 +4,8 @@
 //!
 //! ## Features
 //!
-//! - **SIMD acceleration**: AVX-512, SSE PCLMULQDQ on x86_64
+//! - **SIMD acceleration**: AVX-512, SSE PCLMULQDQ on x86_64; hardware CRC32
+//!   instructions with 4-way interleaving on aarch64 (ARMv8)
 //! - **Parallel processing**: Multi-threaded computation for large data
 //! - **Zero dependencies**: No runtime dependencies (parallel feature is optional)
 //! - **Drop-in compatible**: Implements `std::hash::Hasher` trait
@@ -27,9 +28,9 @@
 //!
 //! ## Performance
 //!
-//! On a 2-core machine with AVX-512:
-//! - Single-threaded: ~8-9 GiB/s
-//! - Multi-threaded: ~17 GiB/s (2.8x faster than crc32fast)
+//! Measured on Apple M1 (aarch64, hardware CRC32):
+//! - Single-threaded: ~22 GiB/s (4-way interleaved hardware CRC)
+//! - Multi-threaded: ~40-54 GiB/s
 //!
 //! ## Feature flags
 //!
